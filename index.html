@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>キャラクター歩行テスト</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#05050a; font-family:'Segoe UI',system-ui,sans-serif; }
+  #canvasWrap { position:fixed; inset:0; }
+  canvas { display:block; touch-action:none; }
+
+  #hud {
+    position:fixed; left:0; right:0; bottom:0;
+    padding:14px 16px calc(14px + env(safe-area-inset-bottom));
+    background:linear-gradient(180deg, rgba(5,5,12,0) 0%, rgba(6,8,18,0.92) 28%, rgba(6,8,18,0.97) 100%);
+    color:#d8f6ff;
+    z-index:10;
+  }
+  .title {
+    font-size:12px; letter-spacing:.18em; color:#7fe8ff; text-transform:uppercase;
+    margin-bottom:10px; opacity:.85; text-shadow:0 0 8px rgba(127,232,255,.5);
+  }
+  .row { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .row label { width:78px; font-size:12px; color:#9fb4c8; flex-shrink:0; }
+  input[type=range] {
+    flex:1; -webkit-appearance:none; height:4px; border-radius:2px;
+    background:linear-gradient(90deg,#ff2fb0,#7fe8ff); outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; width:18px; height:18px; border-radius:50%;
+    background:#fff; box-shadow:0 0 10px #7fe8ff, 0 0 2px #000 inset; cursor:pointer;
+  }
+  .val { width:42px; text-align:right; font-size:12px; color:#7fe8ff; font-variant-numeric:tabular-nums; }
+  .btns { display:flex; gap:8px; margin-top:2px; }
+  button {
+    flex:1; padding:11px 8px; border-radius:10px; border:1px solid rgba(127,232,255,.35);
+    background:rgba(20,24,42,.7); color:#d8f6ff; font-size:13px; letter-spacing:.03em;
+    backdrop-filter:blur(6px);
+  }
+  button.primary { background:linear-gradient(135deg,#ff2fb0,#7c3aed); border:none; color:#fff; font-weight:600; }
+  button:active { filter:brightness(1.3); }
+  #fileInput { display:none; }
+
+  #status {
+    position:fixed; top:0; left:0; right:0; padding:10px 14px;
+    font-size:12px; color:#9fb4c8; z-index:10; text-align:center;
+    background:linear-gradient(180deg, rgba(6,8,18,.9), rgba(6,8,18,0));
+    pointer-events:none;
+  }
+  #status.err { color:#ff7fa8; }
+</style>
+</head>
+<body>
+
+<div id="status">読み込み中…</div>
+<div id="canvasWrap"></div>
+
+<input type="file" id="fileInput" accept=".glb,model/gltf-binary">
+
+<div id="hud">
+  <div class="title">元気度</div>
+  <div class="row">
+    <label>元気度</label>
+    <input type="range" id="energy" min="0.3" max="2.2" step="0.05" value="1.1">
+    <span class="val" id="energyVal">1.10</span>
+  </div>
+  <div class="row">
+    <label>移動速度</label>
+    <input type="range" id="moveSpeed" min="0.3" max="3" step="0.05" value="1.3">
+    <span class="val" id="moveSpeedVal">1.30</span>
+  </div>
+  <div class="btns">
+    <button id="playPause" class="primary">一時停止</button>
+    <button id="loadOther">別のGLBを読込</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function(){
+  "use strict";
+
+  // ---------------------------------------------------------------
+  // このキャラクター(my_character.glb)専用のボーン index マッピング。
+  // GLB内に埋め込まれた7つのポーズアニメーション(Tポーズ/万歳/右手上げ/
+  // ファイト/お辞儀/右キック/腕組み)のチャンネルを解析して、実際に
+  // 動かされているノードだけを抽出したもの。ボーンに名前が無いため、
+  // node index で直接参照する(GLTFLoaderのparser.getDependencyを使用)。
+  //
+  // 検証済み: 右キックのポーズデータから、股関節・膝の前後スイングは
+  // ローカルX軸回転であることを実測で確認済み。肩・肘も同じ仕組みで
+  // 動かしているが、肩の前後スイングが自然に見えるかは要確認(下の
+  // AXIS_ARM を 'y' や 'z' に変えて調整可能)。
+  // ---------------------------------------------------------------
+  const NODE_MAP = {
+    torso:     12,
+    rShoulder: 30, rElbow: 28,
+    lShoulder: 40, lElbow: 38,
+    rHip:      55, rKnee:  51,
+    lHip:      70, lKnee:  66,
+  };
+  const AXIS_ARM = 'x'; // 腕の振りが横向きに見えたら 'y' か 'z' に変更してみてください
+
+  const GLB_CANDIDATES = ['./my_character.glb', './my_character__1_.glb'];
+
+  // ---------------------------------------------------------------
+  // 基本セットアップ
+  // ---------------------------------------------------------------
+  const wrap = document.getElementById('canvasWrap');
+  const statusEl = document.getElementById('status');
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x05050a, 0.045);
+
+  const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 200);
+  camera.position.set(4.5, 3.2, 6.5);
+
+  const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setClearColor(0x05050a);
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  wrap.appendChild(renderer.domElement);
+
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.minDistance = 2.5;
+  controls.maxDistance = 20;
+  controls.maxPolarAngle = Math.PI * 0.49;
+  controls.target.set(0, 1.2, 0);
+
+  // ライティング(ネオン/シンセウェーブ寄り)
+  scene.add(new THREE.HemisphereLight(0x8fdcff, 0x1a0630, 0.9));
+  const key = new THREE.DirectionalLight(0xffffff, 1.0);
+  key.position.set(5, 8, 4);
+  scene.add(key);
+  const rim = new THREE.PointLight(0xff2fb0, 2.2, 30);
+  rim.position.set(-6, 4, -6);
+  scene.add(rim);
+  const rim2 = new THREE.PointLight(0x7fe8ff, 1.6, 30);
+  rim2.position.set(6, 3, -4);
+  scene.add(rim2);
+
+  // 床(ネオングリッド)
+  const grid = new THREE.GridHelper(60, 60, 0x7fe8ff, 0x1c2340);
+  grid.material.opacity = 0.35;
+  grid.material.transparent = true;
+  scene.add(grid);
+  const floorMat = new THREE.MeshStandardMaterial({ color:0x090914, roughness:0.9, metalness:0.1 });
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(30, 48), floorMat);
+  floor.rotation.x = -Math.PI/2;
+  floor.position.y = -0.01;
+  scene.add(floor);
+
+  window.addEventListener('resize', () => {
+    camera.aspect = innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  // ---------------------------------------------------------------
+  // 歩行パラメータ
+  // ---------------------------------------------------------------
+  const cfg = {
+    hipAmp: 0.5, kneeAmp: 0.85, armAmp: 0.45, elbowBase: 0.3,
+    torsoLean: 0.06, torsoTwist: 0.11, bobHeight: 0.05,
+    cycleHz: 1.5, moveSpeed: 1.3, pathRadius: 3.4,
+  };
+  let energy = 1.1;
+  let playing = true;
+  let pathAngle = 0;
+  let clockT = 0;
+
+  const AXIS_X = new THREE.Vector3(1,0,0);
+  const AXIS_Y = new THREE.Vector3(0,1,0);
+  const ARM_AXIS_VEC = AXIS_ARM === 'y' ? AXIS_Y : (AXIS_ARM === 'z' ? new THREE.Vector3(0,0,1) : AXIS_X);
+
+  function setLocal(bone, restQuat, axisVec, angle){
+    const delta = new THREE.Quaternion().setFromAxisAngle(axisVec, angle);
+    bone.quaternion.multiplyQuaternions(delta, restQuat);
+  }
+  function setLocalXY(bone, restQuat, angleX, angleY){
+    const dx = new THREE.Quaternion().setFromAxisAngle(AXIS_X, angleX);
+    const dy = new THREE.Quaternion().setFromAxisAngle(AXIS_Y, angleY);
+    const combined = new THREE.Quaternion().multiplyQuaternions(dx, dy);
+    bone.quaternion.multiplyQuaternions(combined, restQuat);
+  }
+
+  let bones = null, rest = null, character = null, baseY = 0;
+
+  function updateWalk(dt){
+    if (!bones) return;
+    if (playing) clockT += dt;
+
+    const e = energy;
+    const phase = clockT * cfg.cycleHz * e * Math.PI * 2;
+
+    const hipAmp = cfg.hipAmp * e, kneeAmp = cfg.kneeAmp * e, armAmp = cfg.armAmp * e;
+    const bob = cfg.bobHeight * e, twist = cfg.torsoTwist * e;
+
+    const rHipA = Math.sin(phase) * hipAmp;
+    const lHipA = Math.sin(phase + Math.PI) * hipAmp;
+    const rKneeA = Math.min(0, Math.sin(phase)) * kneeAmp;
+    const lKneeA = Math.min(0, Math.sin(phase + Math.PI)) * kneeAmp;
+
+    setLocal(bones.rHip, rest.rHip, AXIS_X, rHipA);
+    setLocal(bones.lHip, rest.lHip, AXIS_X, lHipA);
+    setLocal(bones.rKnee, rest.rKnee, AXIS_X, rKneeA);
+    setLocal(bones.lKnee, rest.lKnee, AXIS_X, lKneeA);
+
+    // 腕は反対側の脚と同位相(自然な歩行の腕振り)
+    const rArmPhase = phase + Math.PI;
+    const lArmPhase = phase;
+    const rShoulderA = Math.sin(rArmPhase) * armAmp;
+    const lShoulderA = Math.sin(lArmPhase) * armAmp;
+    setLocal(bones.rShoulder, rest.rShoulder, ARM_AXIS_VEC, rShoulderA);
+    setLocal(bones.lShoulder, rest.lShoulder, ARM_AXIS_VEC, lShoulderA);
+
+    const rElbowA = -(cfg.elbowBase + Math.max(0, Math.sin(rArmPhase)) * 0.25) * Math.max(0.6, e);
+    const lElbowA = -(cfg.elbowBase + Math.max(0, Math.sin(lArmPhase)) * 0.25) * Math.max(0.6, e);
+    setLocal(bones.rElbow, rest.rElbow, AXIS_X, rElbowA);
+    setLocal(bones.lElbow, rest.lElbow, AXIS_X, lElbowA);
+
+    const leanA = cfg.torsoLean * Math.min(e, 1.6);
+    const twistA = Math.sin(phase) * twist * -1;
+    setLocalXY(bones.torso, rest.torso, leanA, twistA);
+
+    if (character) {
+      character.position.y = baseY + Math.abs(Math.sin(phase)) * bob;
+
+      if (playing) {
+        const angSpeed = (cfg.moveSpeed * e) / cfg.pathRadius;
+        pathAngle += dt * angSpeed;
+      }
+      character.position.x = Math.sin(pathAngle) * cfg.pathRadius;
+      character.position.z = Math.cos(pathAngle) * cfg.pathRadius;
+      character.rotation.y = pathAngle; // 向きがおかしい場合は + Math.PI や + Math.PI/2 を足して調整
+
+      controls.target.lerp(new THREE.Vector3(character.position.x, 1.2, character.position.z), 0.08);
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // GLB読み込み
+  // ---------------------------------------------------------------
+  const loader = new THREE.GLTFLoader();
+
+  async function onModelLoaded(gltf){
+    if (character) scene.remove(character);
+
+    character = new THREE.Group();
+    character.add(gltf.scene);
+    scene.add(character);
+
+    // モデル底面を y=0 に合わせる
+    const box = new THREE.Box3().setFromObject(gltf.scene);
+    gltf.scene.position.y -= box.min.y;
+    baseY = 0;
+
+    const entries = await Promise.all(
+      Object.entries(NODE_MAP).map(async ([key, idx]) => {
+        const obj = await gltf.parser.getDependency('node', idx);
+        return [key, obj];
+      })
+    );
+    bones = Object.fromEntries(entries);
+    rest = {};
+    for (const k in bones) rest[k] = bones[k].quaternion.clone();
+
+    statusEl.style.display = 'none';
+  }
+
+  function onModelError(err){
+    console.error(err);
+    statusEl.textContent = '読み込みに失敗しました。「別のGLBを読込」からファイルを選択してください。';
+    statusEl.classList.add('err');
+    statusEl.style.display = 'block';
+  }
+
+  function tryFetchCandidates(i){
+    if (i >= GLB_CANDIDATES.length){
+      statusEl.textContent = '同フォルダにGLBが見つかりません。「別のGLBを読込」から選択してください。';
+      statusEl.classList.add('err');
+      return;
+    }
+    loader.load(
+      GLB_CANDIDATES[i],
+      (gltf) => onModelLoaded(gltf),
+      undefined,
+      () => tryFetchCandidates(i+1)
+    );
+  }
+  tryFetchCandidates(0);
+
+  document.getElementById('loadOther').addEventListener('click', () => {
+    document.getElementById('fileInput').click();
+  });
+  document.getElementById('fileInput').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    statusEl.textContent = '読み込み中…';
+    statusEl.classList.remove('err');
+    statusEl.style.display = 'block';
+    const reader = new FileReader();
+    reader.onload = () => {
+      loader.parse(reader.result, '', (gltf) => onModelLoaded(gltf), onModelError);
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  // ---------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------
+  const energySlider = document.getElementById('energy');
+  const energyVal = document.getElementById('energyVal');
+  energySlider.addEventListener('input', () => {
+    energy = parseFloat(energySlider.value);
+    energyVal.textContent = energy.toFixed(2);
+  });
+  energyVal.textContent = energy.toFixed(2);
+
+  const moveSlider = document.getElementById('moveSpeed');
+  const moveVal = document.getElementById('moveSpeedVal');
+  moveSlider.addEventListener('input', () => {
+    cfg.moveSpeed = parseFloat(moveSlider.value);
+    moveVal.textContent = cfg.moveSpeed.toFixed(2);
+  });
+  moveVal.textContent = cfg.moveSpeed.toFixed(2);
+
+  const playBtn = document.getElementById('playPause');
+  playBtn.addEventListener('click', () => {
+    playing = !playing;
+    playBtn.textContent = playing ? '一時停止' : '再生';
+  });
+
+  // ---------------------------------------------------------------
+  // メインループ
+  // ---------------------------------------------------------------
+  const clock = new THREE.Clock();
+  function animate(){
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    updateWalk(dt);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+})();
+</script>
+</body>
+</html>
